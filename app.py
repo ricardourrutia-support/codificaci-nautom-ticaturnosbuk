@@ -2,48 +2,63 @@ import streamlit as st
 import pandas as pd
 from unidecode import unidecode
 import io
+import re # Importamos Regex para trabajar con patrones numéricos
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(page_title="Generador de Turnos BUK", layout="wide")
 
-st.title("✈️ Transformador de Turnos para BUK")
+st.title("✈️ Transformador de Turnos para BUK (Versión Mejorada)")
 st.markdown("""
-Esta herramienta toma el **Formato Supervisor** y lo convierte en el formato de carga masiva para **BUK**.
-Realiza el cruce de nombres por RUT y transforma los rangos horarios en Siglas.
+Esta herramienta normaliza los horarios detectando horas y minutos numéricamente, 
+ignorando si dice 'Diurno', si tiene segundos extra o diferencias de ceros (8:00 vs 08:00).
 """)
 
 # --- FUNCIONES DE LIMPIEZA ---
 
 def limpiar_texto(texto):
-    """Normaliza texto: mayúsculas, sin acentos, sin espacios extra."""
+    """Normaliza nombres: mayúsculas, sin acentos, sin espacios extra."""
     if not isinstance(texto, str):
         return str(texto)
     return unidecode(texto.upper().strip())
 
-def limpiar_horario(horario_str):
+def normalizar_horario_estricto(texto_horario):
     """
-    Toma un string de horario sucio (ej: '9:00:00 - 20:00:00 Diurno')
-    y lo convierte a un formato estándar para comparación (ej: '09:00:00-20:00:00').
+    Extrae las horas y minutos usando inteligencia de patrones (Regex).
+    Convierte cualquier formato (8:00, 08:00:00, 8:00 PM) a un estándar 'HH:MM-HH:MM'.
     """
-    if pd.isna(horario_str) or horario_str == "Libre":
+    # 1. Manejo de nulos o Libre
+    if pd.isna(texto_horario):
         return "LIBRE"
     
-    # Quitar palabras como "Diurno", "Nocturno" y espacios
-    s = limpiar_texto(horario_str)
-    s = s.replace("DIURNO", "").replace("NOCTURNO", "").replace(" ", "")
+    s = str(texto_horario).upper().strip()
+    if "LIBRE" in s:
+        return "LIBRE"
     
-    # Normalizar separador
-    # A veces viene como 09:00-20:00 y a veces 09:00:00-20:00:00
-    # Vamos a intentar estandarizar quitando segundos si existen para comparar HH:MM
-    # O simplemente dejándolo limpio de letras.
+    # 2. Buscar patrones de hora: "un digito o dos", seguido de ":", seguido de "dos digitos"
+    # Esto captura 8:00, 08:00, 20:00. Ignora los segundos (:00) si vienen después.
+    patron = r"(\d{1,2}):(\d{2})"
+    coincidencias = re.findall(patron, s)
     
-    return s
+    # Esperamos encontrar al menos 2 horas (entrada y salida)
+    if len(coincidencias) >= 2:
+        # Tomamos la primera coincidencia (Entrada) y la última (Salida)
+        h1, m1 = coincidencias[0]
+        h2, m2 = coincidencias[1] # Ojo: Si hay colación entre medio, esto toma la segunda hora encontrada
+        
+        # Formateamos rellenando con ceros: 8 pasa a 08
+        hora_inicio = f"{int(h1):02d}:{m1}"
+        hora_fin = f"{int(h2):02d}:{m2}"
+        
+        return f"{hora_inicio}-{hora_fin}"
+    
+    return "ERROR_FORMATO"
 
 def buscar_rut(nombre_corto, df_colaboradores):
     """
     Busca el RUT en la base de colaboradores usando coincidencia parcial del nombre.
-    Ej: 'Genesis Olivero' busca coincidencia en 'GENESIS VICTORIA OLIVERO MELEAN'
     """
+    if pd.isna(nombre_corto): return "SIN NOMBRE"
+    
     nombre_clean = limpiar_texto(nombre_corto)
     partes = nombre_clean.split()
     
@@ -58,33 +73,14 @@ def buscar_rut(nombre_corto, df_colaboradores):
     if len(resultado) == 1:
         return resultado.iloc[0]['RUT']
     elif len(resultado) > 1:
-        return "ERROR: Múltiples coincidencias"
+        # Intento de desempate: si el apellido exacto está
+        return "REVISAR: Múltiples nombres similares"
     else:
-        return "ERROR: No encontrado"
-
-def obtener_sigla(horario_sucio, dict_turnos):
-    """
-    Busca la sigla correspondiente al horario sucio.
-    """
-    # 1. Caso directo Libre
-    if pd.isna(horario_sucio): return "L"
-    if str(horario_sucio).strip().upper() == "LIBRE": return "L"
-
-    # 2. Limpieza para comparación
-    h_clean = limpiar_horario(horario_sucio)
-    
-    # Intentar buscar en el diccionario
-    # El diccionario tiene claves limpias también
-    if h_clean in dict_turnos:
-        return dict_turnos[h_clean]
-    
-    # Si falla, intentar variaciones (ej: agregar o quitar segundos)
-    # Esta parte es crítica si los formatos no son idénticos
-    return "REVISAR" # Retorna esto si no encuentra el turno
+        return "REVISAR: Nombre no encontrado"
 
 # --- INTERFAZ DE CARGA ---
 
-uploaded_file = st.file_uploader("Sube el archivo Excel (Turnos Formato Supervisor)", type=["xlsx"])
+uploaded_file = st.file_uploader("Sube el archivo Excel (Turnos, Base y Codificación)", type=["xlsx"])
 
 if uploaded_file:
     try:
@@ -92,39 +88,50 @@ if uploaded_file:
         xls = pd.ExcelFile(uploaded_file)
         
         # Cargar DataFrames
-        df_turnos = pd.read_excel(xls, sheet_name='Turnos Formato Supervisor', header=1) # Header 1 porque la fila 0 son meses
+        df_turnos = pd.read_excel(xls, sheet_name='Turnos Formato Supervisor', header=1) 
         df_colab = pd.read_excel(xls, sheet_name='Base de Colaboradores')
         df_codigos = pd.read_excel(xls, sheet_name='Codificación de Turnos')
 
-        st.success("Archivo cargado correctamente. Procesando datos...")
+        st.success("Archivo cargado. Normalizando horarios...")
 
         # --- PREPROCESAMIENTO ---
 
         # 1. Preparar Base de Colaboradores
         df_colab['Nombre Clean'] = df_colab['Nombre del Colaborador'].apply(limpiar_texto)
         
-        # 2. Preparar Diccionario de Turnos (Horario -> Sigla)
-        # Limpiamos la clave (Horario) igual que limpiaremos los datos de entrada
+        # 2. Preparar Diccionario de Turnos INTELIGENTE
+        # Convertimos la columna de horarios del maestro al mismo formato estandarizado
         diccionario_turnos = {}
+        
+        # Creamos una lista para mostrar qué códigos se cargaron (para debug)
+        codigos_cargados = []
+
         for _, row in df_codigos.iterrows():
-            clave = limpiar_horario(row['Horario'])
-            valor = row['Sigla']
-            diccionario_turnos[clave] = valor
+            horario_original = row['Horario']
+            sigla = row['Sigla']
             
-            # Hack: A veces Excel se come los segundos o los pone.
-            # Agregamos variaciones si es necesario.
-            # Por ahora confiamos en la función limpiar_horario
+            # Aplicamos la misma normalización estricta al maestro
+            clave_estandar = normalizar_horario_estricto(horario_original)
+            
+            if clave_estandar != "ERROR_FORMATO":
+                diccionario_turnos[clave_estandar] = sigla
+                codigos_cargados.append(f"{clave_estandar} -> {sigla}")
+            
+            # Caso especial: Agregar "LIBRE" manualmente si no viene
+            diccionario_turnos["LIBRE"] = "L" 
+
+        with st.expander("Ver mapeo de horarios detectados (Debug)"):
+            st.write(codigos_cargados)
 
         # --- PROCESAMIENTO PRINCIPAL ---
         
         datos_finales = []
         
-        # Iterar sobre la matriz de turnos
-        # La columna 0 es el nombre, el resto son fechas
+        # Columnas de fechas (saltando la primera que es nombres)
         cols_fechas = df_turnos.columns[1:] 
         
         for idx, row in df_turnos.iterrows():
-            nombre_supervisor = row.iloc[0] # Primera columna
+            nombre_supervisor = row.iloc[0]
             if pd.isna(nombre_supervisor): continue
             
             # Buscar RUT
@@ -135,10 +142,19 @@ if uploaded_file:
             # Procesar cada día
             for col_fecha in cols_fechas:
                 valor_celda = row[col_fecha]
-                sigla = obtener_sigla(valor_celda, diccionario_turnos)
                 
-                # Formatear la fecha como string si es datetime
-                nombre_columna_fecha = str(col_fecha).split()[0] # Tomar solo YYYY-MM-DD
+                # 1. Normalizar lo que escribió el supervisor
+                horario_normalizado = normalizar_horario_estricto(valor_celda)
+                
+                # 2. Buscar en el diccionario
+                if horario_normalizado in diccionario_turnos:
+                    sigla = diccionario_turnos[horario_normalizado]
+                else:
+                    # Si falla, devolvemos el horario normalizado para que veas por qué falló
+                    sigla = f"NO_EXISTE: {horario_normalizado}"
+                
+                # Formatear nombre columna fecha
+                nombre_columna_fecha = str(col_fecha).split()[0]
                 fila_buk[nombre_columna_fecha] = sigla
             
             datos_finales.append(fila_buk)
@@ -146,47 +162,46 @@ if uploaded_file:
         # Crear DataFrame Final
         df_final = pd.DataFrame(datos_finales)
 
-        # Mover RUT al principio
+        # Ordenar columnas
         cols = ['RUT', 'Nombre'] + [c for c in df_final.columns if c not in ['RUT', 'Nombre']]
         df_final = df_final[cols]
 
         # --- MOSTRAR RESULTADOS Y ERRORES ---
         
-        st.subheader("Vista Previa del Archivo para BUK")
+        st.subheader("Vista Previa")
         st.dataframe(df_final.head())
         
-        # Detección de errores (Turnos no encontrados o RUTs no encontrados)
-        errores_rut = df_final[df_final['RUT'].str.contains("ERROR", na=False)]
+        # Detección de errores visual
+        celdas_error = df_final.apply(lambda x: x.astype(str).str.contains("NO_EXISTE").any(), axis=1)
+        errores_turnos = df_final[celdas_error]
         
-        # Verificar si hay siglas "REVISAR"
-        celdas_revisar = df_final.apply(lambda x: x.astype(str).str.contains("REVISAR").any(), axis=1)
-        errores_turnos = df_final[celdas_revisar]
+        celdas_rut = df_final[df_final['RUT'].astype(str).str.contains("REVISAR")]
 
-        if not errores_rut.empty:
-            st.warning(f"⚠️ Hay {len(errores_rut)} colaboradores cuyo RUT no se encontró.")
-            st.dataframe(errores_rut[['Nombre', 'RUT']])
-            
         if not errores_turnos.empty:
-            st.warning(f"⚠️ Hay {len(errores_turnos)} filas con turnos que no coincidieron con el maestro.")
-            st.write("Busca las celdas que dicen 'REVISAR'. Probablemente el horario escrito no existe en la hoja 'Codificación de Turnos'.")
+            st.error(f"❌ Aún hay {len(errores_turnos)} filas con turnos no reconocidos.")
+            st.write("Mira la tabla de abajo para ver qué horarios estandarizados no están en tu maestro de códigos:")
+            st.dataframe(errores_turnos)
+        else:
+            st.success("✅ ¡Todos los turnos fueron reconocidos exitosamente!")
+
+        if not celdas_rut.empty:
+             st.warning(f"⚠️ Hay problemas con {len(celdas_rut)} RUTs.")
+             st.dataframe(celdas_rut[['Nombre', 'RUT']])
 
         # --- BOTÓN DE DESCARGA ---
-        
-        # Convertir a Excel en memoria
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             df_final.to_excel(writer, index=False, sheet_name='Carga BUK')
             
         st.download_button(
-            label="📥 Descargar Excel procesado para BUK",
+            label="📥 Descargar Excel Listo",
             data=buffer.getvalue(),
-            file_name="Carga_Masiva_BUK.xlsx",
+            file_name="Carga_Masiva_BUK_V2.xlsx",
             mime="application/vnd.ms-excel"
         )
 
     except Exception as e:
-        st.error(f"Ocurrió un error al procesar el archivo: {e}")
-        st.write("Por favor verifica que el archivo tenga las 3 hojas con los nombres correctos.")
+        st.error(f"Error crítico: {e}")
 
 else:
-    st.info("Por favor sube el archivo Excel para comenzar.")
+    st.info("Sube tu archivo Excel actualizado.")
